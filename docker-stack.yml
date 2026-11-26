@@ -1,0 +1,225 @@
+version: "3.8"
+
+services:
+  pg-primary:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replpass
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=10
+      -c wal_keep_size=512MB
+    volumes:
+      - shop_pg-primary-data:/var/lib/postgresql/data
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 384M
+
+  pgbouncer:
+    image: shop-pgbouncer:latest
+    configs:
+      - source: pgbouncer_ini
+        target: /etc/pgbouncer/pgbouncer.ini
+      - source: pgbouncer_users
+        target: /etc/pgbouncer/userlist.txt
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 64M
+
+  pg-replica1:
+    image: postgres:16-alpine
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: pg-primary
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replpass
+    configs:
+      - source: replica_entry
+        target: /replica-entrypoint.sh
+        mode: 0755
+    entrypoint: ["/bin/sh", "/replica-entrypoint.sh"]
+    command: ["-c", "hot_standby=on", "-c", "hot_standby_feedback=on"]
+    volumes:
+      - shop_pg-replica1-data:/var/lib/postgresql/data
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 384M
+
+  pg-replica2:
+    image: postgres:16-alpine
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: pg-primary
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replpass
+    configs:
+      - source: replica_entry
+        target: /replica-entrypoint.sh
+        mode: 0755
+    entrypoint: ["/bin/sh", "/replica-entrypoint.sh"]
+    command: ["-c", "hot_standby=on", "-c", "hot_standby_feedback=on"]
+    volumes:
+      - shop_pg-replica2-data:/var/lib/postgresql/data
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 384M
+
+  redis-1: &redis-node
+    image: redis:7.4-alpine
+    command: redis-server --port 6379 --cluster-enabled yes --cluster-config-file /data/nodes.conf --cluster-node-timeout 3000 --appendonly no --maxmemory 48mb --maxmemory-policy allkeys-lru
+    networks: [backend]
+    deploy:
+      endpoint_mode: dnsrr
+      replicas: 1
+      resources:
+        limits:
+          memory: 64M
+
+  redis-2:
+    <<: *redis-node
+  redis-3:
+    <<: *redis-node
+  redis-4:
+    <<: *redis-node
+  redis-5:
+    <<: *redis-node
+  redis-6:
+    <<: *redis-node
+
+  redis-init:
+    image: redis:7.4-alpine
+    configs:
+      - source: redis_init_swarm
+        target: /init-swarm.sh
+        mode: 0755
+    command: ["/bin/sh", "/init-swarm.sh"]
+    networks: [backend]
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: none
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: shop
+      RABBITMQ_DEFAULT_PASS: shop
+    volumes:
+      - shop_rabbitdata:/var/lib/rabbitmq
+    ports:
+      - "15672:15672"
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 256M
+
+  consumer:
+    image: shop-consumer:latest
+    command: ["python", "consumer.py"]
+    environment:
+      DATABASE_URL: postgresql://shop:shop@pgbouncer:6432/shop
+      DB_STATEMENT_CACHE_SIZE: "0"
+      RABBITMQ_URL: amqp://shop:shop@rabbitmq:5672/
+      PAYMENT_DELAY_SEC: "0.2"
+      CONSUMER_PREFETCH: "10"
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+
+  app:
+    image: shop-app1:latest
+    environment:
+      DATABASE_URL: postgresql://shop:shop@pgbouncer:6432/shop
+      DATABASE_READ_URLS: postgresql://shop:shop@pg-replica1:5432/shop,postgresql://shop:shop@pg-replica2:5432/shop
+      DB_STATEMENT_CACHE_SIZE: "0"
+      REDIS_URL: redis://redis-1:6379
+      CACHE_ENABLED: "1"
+      RABBITMQ_URL: amqp://shop:shop@rabbitmq:5672/
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+    networks: [backend]
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 5s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 200M
+
+  lb:
+    image: nginx:1.27-alpine
+    configs:
+      - source: nginx_swarm_conf
+        target: /etc/nginx/conf.d/default.conf
+    ports:
+      - "8080:80"
+    networks: [backend]
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 64M
+
+configs:
+  nginx_swarm_conf:
+    file: ./nginx/default-swarm.conf
+  pgbouncer_ini:
+    file: ./pgbouncer/pgbouncer.ini
+  pgbouncer_users:
+    file: ./pgbouncer/userlist.txt
+  replica_entry:
+    file: ./db/replica-entrypoint.sh
+  redis_init_swarm:
+    file: ./redis/init-swarm.sh
+
+volumes:
+  shop_pg-primary-data:
+    external: true
+  shop_pg-replica1-data:
+    external: true
+  shop_pg-replica2-data:
+    external: true
+  shop_rabbitdata:
+    external: true
+
+networks:
+  backend:
+    driver: overlay
+    attachable: true
