@@ -1,18 +1,18 @@
-"""Мини-магазин: FastAPI + PostgreSQL + Redis."""
+﻿"""Мини-магазин: FastAPI + PostgreSQL + Redis Cluster."""
 import asyncio
 import os
 import socket
 from contextlib import asynccontextmanager
 
 import asyncpg
-import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
+from redis.asyncio.cluster import RedisCluster
 
 from cache import Cache
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5432/shop")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://172.30.0.11:6379")
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 PAYMENT_DELAY = float(os.getenv("PAYMENT_DELAY_SEC", "0.2"))
@@ -26,7 +26,9 @@ TTL_TOP = 30
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
-    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
+    # Достаточно ОДНОГО узла — остальные клиент узнает от него сам
+    app.state.redis = RedisCluster.from_url(REDIS_URL, decode_responses=True)
+    await app.state.redis.initialize()
     app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
     yield
     await app.state.redis.aclose()
@@ -58,6 +60,20 @@ async def health():
     await app.state.db.fetchval("SELECT 1")
     await app.state.redis.ping()
     return {"status": "ok", "instance": INSTANCE}
+
+
+@app.get("/admin/cache-node/{product_id}")
+async def cache_node(product_id: int):
+    """На каком узле кластера лежит ключ товара."""
+    key = f"product:{product_id}"
+    rc = app.state.redis
+    node = rc.get_node_from_key(key)
+    return {
+        "key": key,
+        "hash_slot": rc.keyslot(key),
+        "node": f"{node.host}:{node.port}",
+        "cached": await rc.exists(key) == 1,
+    }
 
 
 @app.get("/products/search")
