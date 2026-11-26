@@ -1,20 +1,18 @@
-﻿"""Мини-магазин: FastAPI + PostgreSQL + Redis Cluster + RabbitMQ."""
+﻿"""Мини-магазин: FastAPI + PostgreSQL (Primary + Replicas) + Redis Cluster + RabbitMQ."""
 import os
 import socket
 from contextlib import asynccontextmanager
 
-import asyncpg
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from redis.asyncio.cluster import RedisCluster
 
 from cache import Cache
+from db import Database
 import mq
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5432/shop")
 REDIS_URL = os.getenv("REDIS_URL", "redis://172.30.0.11:6379")
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
 
 TTL_PRODUCT = 60
@@ -24,7 +22,8 @@ TTL_TOP = 30
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
+    app.state.db = Database()
+    await app.state.db.connect()
     app.state.redis = RedisCluster.from_url(REDIS_URL, decode_responses=True)
     await app.state.redis.initialize()
     app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
@@ -57,7 +56,9 @@ async def index():
 
 @app.get("/health")
 async def health():
-    await app.state.db.fetchval("SELECT 1")
+    await app.state.db.write.fetchval("SELECT 1")
+    for pool in app.state.db.reads:
+        await pool.fetchval("SELECT 1")
     await app.state.redis.ping()
     return {"status": "ok", "instance": INSTANCE}
 
@@ -81,7 +82,7 @@ async def search_products(
     q: str = Query(min_length=2, max_length=50),
     limit: int = Query(20, ge=1, le=100),
 ):
-    rows = await app.state.db.fetch(
+    rows = await app.state.db.read.fetch(
         "SELECT id, name, price FROM products WHERE name ILIKE $1 LIMIT $2",
         f"%{q}%",
         limit,
@@ -103,7 +104,7 @@ async def list_products(
         response.headers["X-Cache"] = "HIT"
         return cached
 
-    rows = await app.state.db.fetch(
+    rows = await app.state.db.read.fetch(
         """SELECT id, name, price, stock FROM products
            WHERE category_id = $1
            ORDER BY price DESC
@@ -126,7 +127,7 @@ async def get_product(product_id: int, response: Response):
         response.headers["X-Cache"] = "HIT"
         return cached
 
-    row = await app.state.db.fetchrow(
+    row = await app.state.db.read.fetchrow(
         """SELECT p.id, p.name, p.description, p.price, p.stock, c.name AS category
            FROM products p JOIN categories c ON c.id = p.category_id
            WHERE p.id = $1""",
@@ -149,7 +150,7 @@ async def top_products(response: Response):
         response.headers["X-Cache"] = "HIT"
         return cached
 
-    rows = await app.state.db.fetch(
+    rows = await app.state.db.read.fetch(
         """SELECT p.id, p.name, t.sold
            FROM (SELECT product_id, sum(quantity) AS sold
                  FROM orders
@@ -168,7 +169,7 @@ async def top_products(response: Response):
 
 @app.post("/orders", status_code=202)
 async def create_order(order: OrderIn):
-    async with app.state.db.acquire() as conn:
+    async with app.state.db.write.acquire() as conn:
         async with conn.transaction():
             product = await conn.fetchrow(
                 "SELECT price, stock FROM products WHERE id = $1 FOR UPDATE",
@@ -191,7 +192,6 @@ async def create_order(order: OrderIn):
                 order.quantity,
                 product["price"] * order.quantity,
             )
-    # Публикуем ПОСЛЕ коммита: consumer должен найти заказ в БД
     await mq.publish(app.state.mq_channel, {"order_id": row["id"]})
     await app.state.cache.delete(f"product:{order.product_id}")
     return dict(row)
@@ -199,7 +199,7 @@ async def create_order(order: OrderIn):
 
 @app.get("/orders/{order_id}")
 async def get_order(order_id: int):
-    row = await app.state.db.fetchrow(
+    row = await app.state.db.write.fetchrow(
         """SELECT id, product_id, quantity, total, status, created_at, processed_at
            FROM orders
            WHERE id = $1""",
@@ -208,3 +208,15 @@ async def get_order(order_id: int):
     if row is None:
         raise HTTPException(404, "Заказ не найден")
     return dict(row)
+
+
+@app.get("/admin/replication")
+async def replication_status():
+    """Состояние репликации глазами primary."""
+    rows = await app.state.db.write.fetch(
+        """SELECT client_addr::text, state, sync_state,
+                  pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS lag_bytes,
+                  replay_lag::text
+           FROM pg_stat_replication"""
+    )
+    return [dict(r) for r in rows]
