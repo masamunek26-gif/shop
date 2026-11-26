@@ -1,23 +1,35 @@
-"""Мини-магазин: FastAPI + PostgreSQL."""
+"""Мини-магазин: FastAPI + PostgreSQL + Redis."""
 import asyncio
 import os
 import socket
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query, Request
+import redis.asyncio as redis
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from cache import Cache
+
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5432/shop")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 PAYMENT_DELAY = float(os.getenv("PAYMENT_DELAY_SEC", "0.2"))
 INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
+
+TTL_PRODUCT = 60
+TTL_LIST = 30
+TTL_TOP = 30
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
+    app.state.redis = redis.from_url(REDIS_URL, decode_responses=True)
+    app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
     yield
+    await app.state.redis.aclose()
     await app.state.db.close()
 
 
@@ -44,6 +56,7 @@ async def index():
 @app.get("/health")
 async def health():
     await app.state.db.fetchval("SELECT 1")
+    await app.state.redis.ping()
     return {"status": "ok", "instance": INSTANCE}
 
 
@@ -62,11 +75,18 @@ async def search_products(
 
 @app.get("/products")
 async def list_products(
+    response: Response,
     category_id: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0, le=10000),
 ):
     """Товары категории, сначала самые дорогие."""
+    key = f"products:cat:{category_id}:{limit}:{offset}"
+    cached = await app.state.cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     rows = await app.state.db.fetch(
         """SELECT id, name, price, stock FROM products
            WHERE category_id = $1
@@ -76,11 +96,20 @@ async def list_products(
         limit,
         offset,
     )
-    return [dict(r) for r in rows]
+    data = [dict(r) for r in rows]
+    await app.state.cache.set(key, data, TTL_LIST)
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.get("/products/{product_id}")
-async def get_product(product_id: int):
+async def get_product(product_id: int, response: Response):
+    key = f"product:{product_id}"
+    cached = await app.state.cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     row = await app.state.db.fetchrow(
         """SELECT p.id, p.name, p.description, p.price, p.stock, c.name AS category
            FROM products p JOIN categories c ON c.id = p.category_id
@@ -89,12 +118,21 @@ async def get_product(product_id: int):
     )
     if row is None:
         raise HTTPException(404, "Товар не найден")
-    return dict(row)
+    data = dict(row)
+    await app.state.cache.set(key, data, TTL_PRODUCT)
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.get("/stats/top-products")
-async def top_products():
+async def top_products(response: Response):
     """Топ-10 продаваемых товаров за неделю — «тяжёлый» запрос."""
+    key = "stats:top-products"
+    cached = await app.state.cache.get(key)
+    if cached is not None:
+        response.headers["X-Cache"] = "HIT"
+        return cached
+
     rows = await app.state.db.fetch(
         """SELECT p.id, p.name, t.sold
            FROM (SELECT product_id, sum(quantity) AS sold
@@ -106,7 +144,10 @@ async def top_products():
            JOIN products p ON p.id = t.product_id
            ORDER BY t.sold DESC"""
     )
-    return [dict(r) for r in rows]
+    data = [dict(r) for r in rows]
+    await app.state.cache.set(key, data, TTL_TOP)
+    response.headers["X-Cache"] = "MISS"
+    return data
 
 
 @app.post("/orders", status_code=201)
@@ -135,6 +176,7 @@ async def create_order(order: OrderIn):
                 order.quantity,
                 product["price"] * order.quantity,
             )
+    await app.state.cache.delete(f"product:{order.product_id}")
     return dict(row)
 
 
