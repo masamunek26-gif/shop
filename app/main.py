@@ -1,5 +1,4 @@
-﻿"""Мини-магазин: FastAPI + PostgreSQL + Redis Cluster."""
-import asyncio
+﻿"""Мини-магазин: FastAPI + PostgreSQL + Redis Cluster + RabbitMQ."""
 import os
 import socket
 from contextlib import asynccontextmanager
@@ -10,12 +9,12 @@ from pydantic import BaseModel, Field
 from redis.asyncio.cluster import RedisCluster
 
 from cache import Cache
+import mq
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://shop:shop@localhost:5432/shop")
 REDIS_URL = os.getenv("REDIS_URL", "redis://172.30.0.11:6379")
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1") == "1"
 DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
-PAYMENT_DELAY = float(os.getenv("PAYMENT_DELAY_SEC", "0.2"))
 INSTANCE = os.getenv("INSTANCE_NAME") or socket.gethostname()
 
 TTL_PRODUCT = 60
@@ -26,11 +25,12 @@ TTL_TOP = 30
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=DB_POOL_MAX)
-    # Достаточно ОДНОГО узла — остальные клиент узнает от него сам
     app.state.redis = RedisCluster.from_url(REDIS_URL, decode_responses=True)
     await app.state.redis.initialize()
     app.state.cache = Cache(app.state.redis, enabled=CACHE_ENABLED)
+    app.state.mq_conn, app.state.mq_channel, _ = await mq.connect()
     yield
+    await app.state.mq_conn.close()
     await app.state.redis.aclose()
     await app.state.db.close()
 
@@ -166,9 +166,8 @@ async def top_products(response: Response):
     return data
 
 
-@app.post("/orders", status_code=201)
+@app.post("/orders", status_code=202)
 async def create_order(order: OrderIn):
-    await asyncio.sleep(PAYMENT_DELAY)
     async with app.state.db.acquire() as conn:
         async with conn.transaction():
             product = await conn.fetchrow(
@@ -185,13 +184,15 @@ async def create_order(order: OrderIn):
                 order.product_id,
             )
             row = await conn.fetchrow(
-                """INSERT INTO orders (product_id, quantity, total, status, processed_at)
-                   VALUES ($1, $2, $3, 'processed', now())
+                """INSERT INTO orders (product_id, quantity, total, status)
+                   VALUES ($1, $2, $3, 'pending')
                    RETURNING id, product_id, quantity, total, status, created_at""",
                 order.product_id,
                 order.quantity,
                 product["price"] * order.quantity,
             )
+    # Публикуем ПОСЛЕ коммита: consumer должен найти заказ в БД
+    await mq.publish(app.state.mq_channel, {"order_id": row["id"]})
     await app.state.cache.delete(f"product:{order.product_id}")
     return dict(row)
 
